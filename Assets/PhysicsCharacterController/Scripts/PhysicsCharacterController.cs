@@ -1,18 +1,19 @@
-using System.Collections;
-using System.Collections.Generic;
+using System;
 using UnityEngine;
+using UnityEngine.InputSystem;
 
 public class PhysicsCharacterController : MonoBehaviour
 {
-    [Header("Setup")]
-    public Rigidbody rgbody;
+    private Rigidbody rgbody;
+    private PhysicsCharacterState currentState;
+    private PhysicsCharacterActions inputActions;
+    private InputAction _movementAction;
 
     [Header("Float")]
     public float rayCheckLength;
     public float rideHeight;
     public float rideSpringStrength;
     public float rideSpringDamper;
-    private bool nearGround;
     public float fallForce;
 
     [Header("Rotation")]
@@ -29,35 +30,64 @@ public class PhysicsCharacterController : MonoBehaviour
 
     public Vector3 forceScale;
     private Vector3 storedGoalVel;
-    private Vector3 groundVel;
 
     [Header("Jump")]
     public float jumpForce;
-    private bool canJump=true;
     public float delayBetweenJumps;
     public float coyoteTimeDuration;
-    private bool isInCoyoteTime=false;
 
-    private void Update()
+    public event Action<Rigidbody, Vector2> OnFixedUpdate;
+    public event Action<Rigidbody> OnJump;
+    public event Action<Rigidbody> OnCancelJump;
+
+    private void Awake()
     {
-        //You can jump whenever you're near the ground or in coyote time. The difference between your ground check and ride height acts as an input buffering distance.
-        if (Input.GetButtonDown("Jump") && (nearGround || isInCoyoteTime) && canJump)
-            StartCoroutine(Jump());
+        inputActions = new PhysicsCharacterActions();
+        _movementAction = inputActions.Player.Move;
+        inputActions.Player.Jump.performed += Jump;
+        inputActions.Player.CancelJump.performed += CancelJump;
+        ChangeState(new PhysicsCharacterFalling(this));
+
+        rgbody = GetComponent<Rigidbody>();
+    }
+
+    private void OnEnable()
+    {
+        inputActions.Enable();
+    }
+
+    private void OnDisable()
+    {
+        inputActions.Disable();
     }
 
     void FixedUpdate()
     {
         //DO ALL THE PHYSICS UPDATES
-        UpdateMove();
-        UpdateFloat();
+        Vector2 moveInput = _movementAction.ReadValue<Vector2>();
+        UpdateMove(moveInput);
         UpdateRotation();
-        UpdateFall();
+        OnFixedUpdate?.Invoke(rgbody, moveInput);
     }
 
-    void UpdateMove()
+    public bool NearGround(out RaycastHit rayHit) => Physics.Raycast(transform.position, Vector3.down, out rayHit, rayCheckLength);
+
+    public void ChangeState(PhysicsCharacterState state)
+    {
+        if (currentState != null)
+        {
+            Debug.Log($"Exit state: {currentState.GetType()}");
+            currentState.ClearState();
+        }
+        currentState = state;
+        currentState.InitializeState();
+        Debug.Log($"Enter state: {state.GetType()}");
+    }
+
+    void UpdateMove(Vector2 moveInput)
     {
         //Get raw input
-        move = new Vector3(Input.GetAxis("Horizontal"), 0, Input.GetAxis("Vertical"));
+        move = new Vector3(moveInput.x, 0, moveInput.y);
 
         //Normalize to account for diagonals being stronger than simple directions.
         if (move.magnitude > 1.0f)
@@ -70,7 +100,7 @@ public class PhysicsCharacterController : MonoBehaviour
         Vector3 goalVel = move * maxSpeed;
 
         //Lerp goal velocity towards new calculated goal velocity.
-        storedGoalVel = Vector3.MoveTowards(storedGoalVel, goalVel + groundVel, accel * Time.fixedDeltaTime);
+        storedGoalVel = Vector3.MoveTowards(storedGoalVel, goalVel + currentState.MoveModifier, accel * Time.fixedDeltaTime);
 
         //calculate needed acceleration to reach goal velocity in a single fixed update.
         Vector3 neededAccel = (storedGoalVel - rgbody.velocity) / Time.fixedDeltaTime;
@@ -83,65 +113,12 @@ public class PhysicsCharacterController : MonoBehaviour
         rgbody.AddForce(Vector3.Scale(neededAccel * rgbody.mass, forceScale));
     }
 
-    void UpdateFloat()
-    {
-        //Raycast down.
-        Vector3 rayDir = Vector3.down;
-
-        RaycastHit _rayHit;
-
-        //Check if near ground. If isn't but was on last frame, activate coyote time.
-        bool cachedNearGround = nearGround;
-        nearGround = Physics.Raycast(transform.position, rayDir, out _rayHit, rayCheckLength);
-        if (!nearGround && cachedNearGround)
-            StartCoroutine(CoyoteTime());
-        
-        //If raycast touches ground
-        if (nearGround)
-        {
-            Vector3 vel = rgbody.velocity;
-
-            Vector3 otherVel = Vector3.zero;
-            groundVel = Vector3.zero;
-
-            //if rigidbody found, get its velocity (useful for moving platforms and the like)
-            Rigidbody hitBody = _rayHit.rigidbody;
-            if (hitBody != null)
-            {
-                otherVel = hitBody.velocity;
-                groundVel = hitBody.velocity;
-            }
-            
-            //calculate spring force to add to reach ride height with spring strength and damper taken into account.
-            float rayDirVel = Vector3.Dot(rayDir, vel);
-            float otherDirVel = Vector3.Dot(rayDir, otherVel);
-
-            float relVel = rayDirVel - otherDirVel;
-            float x = _rayHit.distance - rideHeight;
-            float springForce = (x * rideSpringStrength) - (relVel * rideSpringDamper);
-
-            //add spring force.
-            rgbody.AddForce(rayDir * springForce);
-
-            //Add reciprocal force to object under feet.
-            if (hitBody != null)
-                hitBody.AddForceAtPosition(rayDir * -springForce, _rayHit.point);
-        }
-    }
-
-    void UpdateFall()
-    {
-        //add a downwards force whenever the player is in the air and isn't ascending.
-        if (!nearGround && rgbody.velocity.y <= 0)
-            rgbody.AddForce(Vector3.down * fallForce);
-    }
-
     void UpdateRotation()
     {
         //if current input is out of deadzone, get an upright position facing movement input.
         Quaternion characterCurrent = transform.rotation;
         Quaternion goalRotation = Quaternion.LookRotation(move.magnitude>.05f? move: transform.forward, Vector3.up);
-        Quaternion toGoal = StaticFunctions_Quaternions.ShortestRotation(goalRotation, characterCurrent);
+        Quaternion toGoal = goalRotation.ShortestRotation(characterCurrent);
 
         Vector3 rotAxis;
         float rotDegrees;
@@ -156,25 +133,8 @@ public class PhysicsCharacterController : MonoBehaviour
         rgbody.AddTorque((rotAxis * (rotRadians* rotationSpringStrength)) - (rgbody.angularVelocity* rotationSpringDamper));
     }
 
-    IEnumerator Jump()
-    {
-        //Zero current Y velocity
-        rgbody.velocity = new Vector3(rgbody.velocity.x, 0, rgbody.velocity.z);
+    void Jump(InputAction.CallbackContext obj) => OnJump?.Invoke(rgbody);
 
-        //Add vertical jump force
-        rgbody.AddForce(Vector3.up * jumpForce);
-
-        //Delay until next jump
-        canJump = false;
-        yield return new WaitForSeconds(delayBetweenJumps);
-        canJump = true;
-    }
-
-    IEnumerator CoyoteTime()
-    {
-        isInCoyoteTime = true;
-        yield return new WaitForSeconds(coyoteTimeDuration);
-        isInCoyoteTime = false;
-    }
+    void CancelJump(InputAction.CallbackContext obj) => OnCancelJump?.Invoke(rgbody);
 
 }
